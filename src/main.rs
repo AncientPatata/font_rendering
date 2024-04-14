@@ -8,7 +8,7 @@ fn bit_is_set(flag: u8, flag_bit_index: u8) -> bool {
     return ((flag >> flag_bit_index) & 1) == 1;
 }
 
-fn get_coordinates(cursor: &mut Cursor<Vec<u8>>, flags: Vec<u8>, is_x: bool) -> Result<Vec<i16>> {
+fn get_coordinates(cursor: &mut Cursor<Vec<u8>>, flags: &Vec<u8>, is_x: bool) -> Result<Vec<i16>> {
     let num_points = flags.len();
     let mut coords: Vec<i16> = vec![0i16; num_points as usize];
 
@@ -81,48 +81,8 @@ impl GlyphData {
             i += 1;
         }
 
-        let mut x_coords: Vec<i16> = vec![0i16; num_points as usize];
-        let mut y_coords: Vec<i16> = vec![0i16; num_points as usize];
-
-        // reading x coordinates
-        for i in 0..(num_points as usize) {
-            x_coords[i] = if i == 0 { 0 } else { x_coords[i - 1] };
-            let flag: u8 = flags[i as usize];
-            let on_curve = bit_is_set(flag, 0);
-
-            let is_x_short = bit_is_set(flag, 1);
-            let is_x_positive_short = bit_is_set(flag, 4);
-
-            // coordinate offset is 1 byte
-            if is_x_short {
-                let offset: u8 = cursor.read_u8()?;
-                let sign: i16 = if is_x_positive_short { 1 } else { -1 };
-                x_coords[i] += sign * (offset as i16);
-            } else if !is_x_positive_short {
-                // coordinate offset value is represented by 2 byes (signed)
-                x_coords[i] += cursor.read_i16::<BigEndian>()?;
-            }
-        }
-
-        // reading y coordinates
-        for i in 0..(num_points as usize) {
-            y_coords[i] = if i == 0 { 0 } else { y_coords[i - 1] };
-            let flag: u8 = flags[i as usize];
-            let on_curve = bit_is_set(flag, 0);
-
-            let is_y_short = bit_is_set(flag, 2);
-            let is_y_positive_short = bit_is_set(flag, 5);
-
-            // coordinate offset is 1 byte
-            if is_y_short {
-                let offset: u8 = cursor.read_u8()?;
-                let sign: i16 = if is_y_positive_short { 1 } else { -1 };
-                y_coords[i] += sign * (offset as i16);
-            } else if !is_y_positive_short {
-                // coordinate offset value is represented by 2 byes (signed)
-                y_coords[i] += cursor.read_i16::<BigEndian>()?;
-            }
-        }
+        let mut x_coords: Vec<i16> = get_coordinates(cursor, &flags, true)?;
+        let mut y_coords: Vec<i16> = get_coordinates(cursor, &flags, false)?;
 
         Ok(GlyphData {
             x_coords,
@@ -167,13 +127,36 @@ impl Font {
             let num_glyphs = cursor.read_u16::<BigEndian>()?;
             println!("Font contains {num_glyphs} glyphs");
 
+            let (_, head_table_offset, _) = tables.get("head").unwrap();
+            cursor.seek(SeekFrom::Start((head_table_offset + 50) as u64)); // skip some 50 bytes of additional information
+
+            let use_two_byte_entry = cursor.read_i16::<BigEndian>()? == 0; // check if we use two bye entries (indexToLocFormat)
+
+            let (_, location_table_offset, _) = tables.get("loca").unwrap();
+
             // working with the glyph table
             let (_, glyph_table_offset, glyph_table_len) = tables.get("glyf").unwrap();
-            cursor.seek(SeekFrom::Start(*glyph_table_offset as u64));
+            // cursor.seek(SeekFrom::Start(*glyph_table_offset as u64));
 
+            let mut glyph_locations: Vec<u32> = vec![0u32; num_glyphs as usize];
             let mut glyph_data_list = Vec::<GlyphData>::new();
 
-            for i in 0..num_glyphs {
+            for i in 0..(num_glyphs as u64) {
+                cursor.seek(SeekFrom::Start(
+                    (*location_table_offset as u64 + i * (if use_two_byte_entry { 2 } else { 4 }))
+                        as u64,
+                ));
+
+                let glyph_start_offset = if use_two_byte_entry {
+                    (cursor.read_u16::<BigEndian>()? * 2) as u32
+                } else {
+                    cursor.read_u32::<BigEndian>()?
+                };
+
+                glyph_locations[i as usize] = glyph_table_offset + glyph_start_offset;
+                cursor.seek(SeekFrom::Start(
+                    (glyph_table_offset + glyph_start_offset) as u64,
+                ));
                 match GlyphData::from_cursor(&mut cursor) {
                     Ok(glyph_data) => {
                         println!("{i} \n");
@@ -181,6 +164,7 @@ impl Font {
                     }
                     Err(err) => println!("Error : {err}"),
                 }
+                // break;
             }
 
             if let Some(glyph) = glyph_data_list.get(0) {
